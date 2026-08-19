@@ -1,14 +1,18 @@
 # DATA-1 — Regulatory Reporting & Reconciliation Platform
 
-**Status: ~20% slice.** The reconciliation engine, the control-total gate, and
-the break taxonomy are built and scored against planted ground truth. Airflow,
-dbt, the exception-review workflow with audit trail, and the reporting marts are
+**Status: ~50%.** The reconciliation engine, the control-total gate, the break
+taxonomy, the break workflow with an append-only audit trail, and end-to-end
+lineage are built and tested (24 tests). Airflow, dbt and the reporting marts are
 not.
 
 ```bash
 python run_recon.py      # generates sources on first run, then reconciles
+python run_workflow.py   # break queue, escalation, audit trail, lineage trace
 python -m pytest tests -q
 ```
+
+See [docs/CONTROLS.md](docs/CONTROLS.md) for the controls narrative, written in
+the language auditors read, including a table of the control gaps that remain.
 
 ## What is built
 
@@ -80,24 +84,49 @@ days apart, so they were being filed as exact matches — understating the timin
 population that ops staffs against. Exact now requires identical calendar dates;
 timing recall went 0.826 → 1.000.
 
-## What is NOT built (the other 80%)
+## Break workflow (`python run_workflow.py`)
 
-1. **Orchestration** — no Airflow. `run_recon.py` is a script, not a DAG, with no
-   schedule, no retries, no SLA miss alerting.
-2. **Great Expectations validation gates** as a declared suite (checks are
-   hand-rolled inside `ingest.py`).
-3. **dbt conformed layer and reporting marts.** There is no monthly
-   regulatory-style report and no drill-down from an aggregate to source rows —
-   the end-to-end trace demo is missing, and it is one of the spec's headline
-   differentiators.
-4. **Break workflow**: no exceptions table, no review UI, no resolution reason
-   codes, no who/what/when audit trail. Breaks are classified and aged in memory
-   and printed. Aging without a workflow is a report, not an operations tool.
-5. **docs/CONTROLS.md** — the controls narrative, lineage diagram, and timeliness
-   SLA are not written.
-6. **Fuzzy candidate pairing** for residuals (pass 3 currently classifies rather
-   than attempting near-match scoring on unkeyed items).
-7. The processor feed has **no completeness control at all** — an event stream
-   can't carry a trailer, so it needs sequence-number or heartbeat gap detection.
-   That gap is real and currently unaddressed; `parse_events` says so in a
-   docstring rather than faking a control total.
+Aging without a workflow is a report, not an operations tool. What makes
+"resolved" mean something:
+
+- **Reason codes are a closed vocabulary.** Free text is refused — a vocabulary
+  that cannot be aggregated can never reveal that most breaks share one upstream
+  cause.
+- **Materiality limits live in code.** Closing a $49,408 break as `written_off`
+  (limit $100) raises. A limit in a policy document is a suggestion.
+- **Segregation of duties**: each code names a required role. An analyst cannot
+  apply `counterparty_error`; only a controller may write off.
+- **The age clock does not reset on recurrence.** A break that comes back keeps
+  its original `first_seen`. If recurrence created a new item, something
+  unresolved for three weeks would be forever one day old and never escalate —
+  the most common way a break queue fails silently.
+- **The audit trail is append-only**, enforced by triggers on `UPDATE` and
+  `DELETE`. An audit trail you can edit is application logging with a nicer name.
+
+## End-to-end trace
+
+`ingest.Record` carries `source` and `line_no` from the moment of parsing and
+nothing downstream drops them, so any report figure expands to the rows behind it
+and re-adds to prove it ties. Lineage is not a feature added at the end — it is a
+column nothing is allowed to discard.
+
+## What is NOT built
+
+1. **Orchestration** — no Airflow. `run_recon.py` is a script, not a DAG: no
+   schedule, no retries, no alerting. The 8am SLA in the spec is therefore **not
+   claimed**, because asserting one without a scheduler measuring it is a control
+   assertion with no control behind it.
+2. **Great Expectations** as a declared suite (checks are hand-rolled inside
+   `ingest.py`).
+3. **dbt conformed layer and reporting marts.** `src/lineage.py` aggregates in
+   Python; there is no warehouse and no published monthly report artifact.
+4. **Persistence.** The break queue is in-memory per run, so aging across real
+   calendar days is shown by passing a later `as_of`, not by stored history.
+5. **Review UI**, assignment, and four-eyes review on high-value resolutions.
+6. **Fuzzy candidate pairing** for residuals — pass 3 classifies rather than
+   scoring near-matches on unkeyed items. (SE-2 does implement scored candidate
+   matching.)
+7. The processor feed still has **no completeness control** — an event stream
+   cannot carry a trailer, so it needs sequence-number or heartbeat gap
+   detection. This is the largest open control gap, and `docs/CONTROLS.md` lists
+   it as such rather than faking a control total.
