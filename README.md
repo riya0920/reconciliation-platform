@@ -1,9 +1,9 @@
 # DATA-1 — Regulatory Reporting & Reconciliation Platform
 
-**Status: ~50%.** The reconciliation engine, the control-total gate, the break
-taxonomy, the break workflow with an append-only audit trail, and end-to-end
-lineage are built and tested (24 tests). Airflow, dbt and the reporting marts are
-not.
+**Status: ~70%.** Reconciliation engine, control-total gate, break taxonomy,
+break workflow with an append-only audit trail, end-to-end lineage, and a DAG
+runner with retries / fail-fast gates / SLA enforcement -- **33 tests**. Airflow
+itself and the dbt reporting marts are not built.
 
 ```bash
 python run_recon.py      # generates sources on first run, then reconciles
@@ -112,10 +112,13 @@ column nothing is allowed to discard.
 
 ## What is NOT built
 
-1. **Orchestration** — no Airflow. `run_recon.py` is a script, not a DAG: no
-   schedule, no retries, no alerting. The 8am SLA in the spec is therefore **not
-   claimed**, because asserting one without a scheduler measuring it is a control
-   assertion with no control behind it.
+1. **A SCHEDULER.** `src/orchestrate.py` is a real DAG runner -- dependency
+   ordering, cycle detection at construction, transient-vs-permanent retry
+   policy, fail-fast gates that block all descendants, and per-task plus
+   pipeline SLA enforcement, with 9 tests. What it does not do is schedule
+   itself: something has to invoke it at 07:00, and that something is cron or
+   Airflow. The 8am SLA is therefore **enforced but not triggered**, and a
+   deadline nothing starts is still not a control.
 2. **Great Expectations** as a declared suite (checks are hand-rolled inside
    `ingest.py`).
 3. **dbt conformed layer and reporting marts.** `src/lineage.py` aggregates in
