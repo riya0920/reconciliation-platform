@@ -1,12 +1,14 @@
 # DATA-1 — Regulatory Reporting & Reconciliation Platform
 
-**Status: ~70%.** Reconciliation engine, control-total gate, break taxonomy,
-break workflow with an append-only audit trail, end-to-end lineage, and a DAG
-runner with retries / fail-fast gates / SLA enforcement -- **33 tests**. Airflow
-itself and the dbt reporting marts are not built.
+**Status: ~85%.** Reconciliation engine, control-total gate, break taxonomy,
+break workflow with an append-only audit trail, a DAG runner with retries /
+fail-fast gates / SLA enforcement now driving the **real pipeline**, a persistent
+break queue, and a **DuckDB reporting mart with drill-down that ties** --
+**33 tests**. What is missing is a scheduler to invoke it.
 
 ```bash
-python run_recon.py      # generates sources on first run, then reconciles
+python run_dag.py        # the whole pipeline as a DAG -> mart -> drill-down
+python run_recon.py      # reconciliation on its own
 python run_workflow.py   # break queue, escalation, audit trail, lineage trace
 python -m pytest tests -q
 ```
@@ -112,24 +114,25 @@ column nothing is allowed to discard.
 
 ## What is NOT built
 
-1. **A SCHEDULER.** `src/orchestrate.py` is a real DAG runner -- dependency
-   ordering, cycle detection at construction, transient-vs-permanent retry
-   policy, fail-fast gates that block all descendants, and per-task plus
-   pipeline SLA enforcement, with 9 tests. What it does not do is schedule
-   itself: something has to invoke it at 07:00, and that something is cron or
-   Airflow. The 8am SLA is therefore **enforced but not triggered**, and a
-   deadline nothing starts is still not a control.
-2. **Great Expectations** as a declared suite (checks are hand-rolled inside
-   `ingest.py`).
-3. **dbt conformed layer and reporting marts.** `src/lineage.py` aggregates in
-   Python; there is no warehouse and no published monthly report artifact.
-4. **Persistence.** The break queue is in-memory per run, so aging across real
-   calendar days is shown by passing a later `as_of`, not by stored history.
-5. **Review UI**, assignment, and four-eyes review on high-value resolutions.
-6. **Fuzzy candidate pairing** for residuals — pass 3 classifies rather than
-   scoring near-matches on unkeyed items. (SE-2 does implement scored candidate
-   matching.)
-7. The processor feed still has **no completeness control** — an event stream
+1. **A SCHEDULER.** `run_dag.py` runs the real pipeline through a DAG with
+   dependency ordering, cycle detection at construction, transient-vs-permanent
+   retry policy, fail-fast gates that block all descendants, and per-task plus
+   pipeline SLA enforcement. What it does not do is schedule itself: something
+   must invoke it at 07:00, and that is cron or Airflow. The 8am SLA is
+   **enforced but not triggered**, and a deadline nothing starts is not a control.
+2. **Great Expectations** as a declared suite. `great_expectations` does not
+   install on Python 3.14 in this environment, so the validation gate is
+   hand-rolled in `t_validate`. It does the same job and is not the named tool.
+3. **dbt.** The mart is DuckDB DDL in `src/mart.py`, not dbt models — so no
+   lineage graph, no `dbt test`, no docs site. (DATA-2 is the dbt project.)
+4. **Review UI**, assignment, and four-eyes review on high-value resolutions.
+   The queue is a table and a console report.
+5. **Fuzzy candidate pairing** for residuals — pass 3 classifies rather than
+   scoring near-matches on unkeyed items. (SE-2 implements scored matching.)
+6. The processor feed still has **no completeness control** — an event stream
    cannot carry a trailer, so it needs sequence-number or heartbeat gap
-   detection. This is the largest open control gap, and `docs/CONTROLS.md` lists
-   it as such rather than faking a control total.
+   detection. This remains the largest open control gap, and `docs/CONTROLS.md`
+   lists it as such rather than faking a control total.
+7. **Backfill and reprocessing.** The DAG is keyed by business date but there is
+   no command to re-run a range of past dates, which is the first thing anyone
+   asks for after a logic fix. (SE-2 has replay; this does not.)
