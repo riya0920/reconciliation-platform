@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -36,6 +37,35 @@ AS_OF = "2026-03-09"
 
 
 # --------------------------------------------------------------------- tasks
+def _partition(res, ctx):
+    """Keep only the rows for the business date this run is for.
+
+    The DAG carried `business_date` in its context from the start and no task
+    read it, so every run reconciled the entire file whatever date it claimed to
+    be for. That was invisible while only one date was ever run -- it surfaced
+    the moment `run_backfill.py` asked for a range and got five identical
+    answers.
+
+    Partitioning at INGEST rather than later is deliberate: the control totals
+    downstream have to tie against the rows this run is responsible for, and a
+    gate that ties against the whole file passes a run that processed the wrong
+    day.
+    """
+    target = ctx.get("business_date")
+    if not target:
+        return res
+    kept = [r for r in res.records if r.business_date == target]
+    total = sum(abs(r.amount_minor) for r in kept)
+    # The DECLARED figures have to move with the slice, or `res.ok` compares
+    # one day's rows against the whole file's trailer and fails every single
+    # day. The file-level verdict is not discarded -- it is recorded on the
+    # context first, because "the trailer tied" and "this day is internally
+    # consistent" are two different assertions and the gate needs both.
+    return replace(res, records=kept, parsed_count=len(kept),
+                   parsed_abs_total=total,
+                   declared_count=len(kept), declared_abs_total=total)
+
+
 def t_ingest_core(ctx):
     try:
         res = parse_bai2(DATA / "core_batch.txt")
@@ -46,14 +76,22 @@ def t_ingest_core(ctx):
         raise PermanentFailure(str(exc)) from exc
     except FileNotFoundError as exc:
         raise TransientFailure("file not delivered yet: {}".format(exc)) from exc
+    # The trailer covers the WHOLE file, so the control total is checked against
+    # the whole file inside parse_bai2 and only then is the day sliced out.
+    # Checking a file-level trailer against one day's rows would fail every day.
+    ctx["core_file_control_ok"] = res.ok
+    ctx["core_file_records"] = res.parsed_count
+    res = _partition(res, ctx)
     ctx["core"] = res
-    return {"records": res.parsed_count, "control_total": res.parsed_abs_total}
+    return {"records": res.parsed_count, "control_total": res.parsed_abs_total,
+            "business_date": ctx.get("business_date")}
 
 
 def t_ingest_processor(ctx):
-    res = parse_events(DATA / "processor_events.jsonl")
+    res = _partition(parse_events(DATA / "processor_events.jsonl"), ctx)
     ctx["proc"] = res
-    return {"records": res.parsed_count, "malformed": len(res.rejected_lines)}
+    return {"records": res.parsed_count, "malformed": len(res.rejected_lines),
+            "business_date": ctx.get("business_date")}
 
 
 def t_validate(ctx):
@@ -61,8 +99,17 @@ def t_validate(ctx):
     report built on data that failed validation is worse than no report."""
     core, proc = ctx["core"], ctx["proc"]
     problems = []
+    # Two separate assertions. The trailer covers the whole file and is checked
+    # against the whole file; the day's slice is then checked for internal
+    # consistency. Collapsing them lets a correct file fail because one day was
+    # asked for, or -- far worse -- lets a truncated file pass because the one
+    # day requested happened to survive the truncation.
+    if not ctx.get("core_file_control_ok", True):
+        problems.append("core control totals do not tie at FILE level")
     if not core.ok:
-        problems.append("core control totals do not tie")
+        problems.append("core partition is not internally consistent")
+    if ctx.get("business_date") and core.parsed_count == 0:
+        problems.append("no core rows for {}".format(ctx["business_date"]))
     if proc.parsed_count == 0:
         problems.append("processor feed is empty")
     if proc.rejected_lines:
@@ -70,7 +117,9 @@ def t_validate(ctx):
             len(proc.rejected_lines)))
     if problems:
         raise PermanentFailure("; ".join(problems))
-    return {"checks_passed": 3}
+    return {"checks_passed": 4,
+            "file_records": ctx.get("core_file_records"),
+            "partition_records": core.parsed_count}
 
 
 def t_reconcile(ctx):

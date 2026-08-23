@@ -1,16 +1,21 @@
 # DATA-1 — Regulatory Reporting & Reconciliation Platform
 
-**Status: ~85%.** Reconciliation engine, control-total gate, break taxonomy,
-break workflow with an append-only audit trail, a DAG runner with retries /
-fail-fast gates / SLA enforcement now driving the **real pipeline**, a persistent
-break queue, and a **DuckDB reporting mart with drill-down that ties** --
-**33 tests**. What is missing is a scheduler to invoke it.
+**Status: ~95%.** Reconciliation engine, control-total gate, break taxonomy,
+break workflow with an append-only audit trail, a DAG runner driving the **real
+pipeline**, a persistent break queue, a **DuckDB reporting mart with drill-down
+that ties**, **stream completeness for the processor feed** (sequence gaps +
+heartbeats, scored against planted transport faults), and a **resumable
+date-range backfill** -- **49 tests**. What is missing is a scheduler to invoke
+it.
 
 ```bash
-python run_dag.py        # the whole pipeline as a DAG -> mart -> drill-down
-python run_recon.py      # reconciliation on its own
-python run_workflow.py   # break queue, escalation, audit trail, lineage trace
-python -m pytest tests -q
+python src/generate.py                            # two feeds + planted faults
+python run_dag.py                                 # DAG -> mart -> drill-down
+python run_completeness.py                        # stream completeness, scored
+python run_backfill.py --from 2026-03-02 --to 2026-03-06 --dry-run
+python run_recon.py                               # reconciliation on its own
+python run_workflow.py                            # queue, escalation, audit
+python -m pytest tests -q                         # 49 tests
 ```
 
 See [docs/CONTROLS.md](docs/CONTROLS.md) for the controls narrative, written in
@@ -112,14 +117,95 @@ nothing downstream drops them, so any report figure expands to the rows behind i
 and re-adds to prove it ties. Lineage is not a feature added at the end — it is a
 column nothing is allowed to discard.
 
+## Completeness for a feed that cannot carry a trailer
+
+This used to be the project's largest open control gap, and the reasoning behind
+leaving it open was correct: a batch file declares its own count and total in a
+trailer, an event stream has no end and therefore has no trailer. Correct, and
+the wrong place to stop — "we cannot tie this feed" is not a control, it is the
+absence of one.
+
+An event stream can be made checkable. Not with a fake trailer, but with two
+things the producer emits and the consumer checks:
+
+| signal | catches | blind to |
+|---|---|---|
+| per-partition monotonic **sequence** | losses *inside* a stream that is still flowing | the stream stopping |
+| periodic **heartbeat** with the producer's high-water mark | silence, and truncation of the tail | holes in the middle |
+
+The generator plants three transport faults — the events are correct, they simply
+do not all arrive — and `run_completeness.py` scores the detector against them:
+
+| fault | planted | detected | |
+|---|---|---|---|
+| dropped events (p1) | 12 | 12 | OK |
+| delayed but delivered (p2) | 5 | 5 | OK |
+| silent partition (p3) | 1 | 1 | OK |
+
+**The second row is a negative result and it is the one that matters.** Five
+events arrived out of order and *none* is reported as missing. A gap detector
+that cannot tell late from lost fires on every out-of-order delivery, and a team
+paged by it stops reading it inside a week. `SequenceTracker` holds a hole open
+for `reorder_grace` events before calling it a loss.
+
+**The third row is one a sequence check structurally cannot produce.** Partition
+p3 stopped emitting 40 minutes before close. There is no gap — there is no later
+event to be out of sequence with — so the sequence is perfectly intact and the
+feed is dead. Only the heartbeat sees it.
+
+And the distinction worth taking away:
+
+```
+p1     producer   1098   lag    0   <- caught up AND missing 12 events
+```
+
+**Lag and gaps answer different questions.** High-water lag detects *truncation*:
+we are behind the producer. Sequence gaps detect *holes*: we caught up to the
+latest event and something in the middle never arrived. A monitoring pack that
+watches only consumer lag — which is the usual one — sees p1 as healthy.
+
+## Backfill, and the bug it exposed
+
+`run_backfill.py --from D1 --to D2` re-runs the pipeline over a date range:
+idempotent per date, oldest first, resumable from a recorded completion list,
+with `--dry-run`.
+
+Oldest-first is not a preference. Later dates are computed against earlier
+closing balances, so a reverse-order backfill corrects each day against a
+predecessor that has not been corrected yet — it completes, it reports success,
+and every figure still carries the error it was run to remove.
+
+**The DAG carried a `business_date` in its context from the first version and no
+task ever read it.** Every run reconciled the entire file whatever date it
+claimed to be for. That was invisible while only one date was ever run; asking
+for a range and getting five identical answers is what exposed it. Ingestion now
+partitions by date, and the per-date columns are the evidence:
+
+```
+date             tasks  failed   matched   breaks   seconds    result
+2026-03-02           8       0       846      103     11.38        OK
+2026-03-03           8       0       841      128      8.55        OK
+2026-03-04           8       0       835      125      8.47        OK
+2026-03-05           8       0       844      120     10.29        OK
+2026-03-06           8       0       851      101      8.09        OK
+```
+
+Partitioning broke the validation gate on the first attempt, in an instructive
+way: `IngestResult.ok` compared one day's rows against the whole file's trailer
+and failed every day. The fix is not to relax the check but to recognise that
+there are **two** assertions — the trailer tied at file level, and this day's
+slice is internally consistent — and to require both. Collapsing them lets a
+correct file fail because one day was asked for, or, far worse, lets a truncated
+file pass because the day requested happened to survive the truncation.
+
 ## What is NOT built
 
 1. **A SCHEDULER.** `run_dag.py` runs the real pipeline through a DAG with
    dependency ordering, cycle detection at construction, transient-vs-permanent
-   retry policy, fail-fast gates that block all descendants, and per-task plus
-   pipeline SLA enforcement. What it does not do is schedule itself: something
-   must invoke it at 07:00, and that is cron or Airflow. The 8am SLA is
-   **enforced but not triggered**, and a deadline nothing starts is not a control.
+   retry policy, fail-fast gates and per-task plus pipeline SLA enforcement. What
+   it does not do is schedule itself: something must invoke it at 07:00, and that
+   is cron or Airflow. The 8am SLA is **enforced but not triggered**, and a
+   deadline nothing starts is not a control.
 2. **Great Expectations** as a declared suite. `great_expectations` does not
    install on Python 3.14 in this environment, so the validation gate is
    hand-rolled in `t_validate`. It does the same job and is not the named tool.
@@ -127,12 +213,16 @@ column nothing is allowed to discard.
    lineage graph, no `dbt test`, no docs site. (DATA-2 is the dbt project.)
 4. **Review UI**, assignment, and four-eyes review on high-value resolutions.
    The queue is a table and a console report.
-5. **Fuzzy candidate pairing** for residuals — pass 3 classifies rather than
-   scoring near-matches on unkeyed items. (SE-2 implements scored matching.)
-6. The processor feed still has **no completeness control** — an event stream
-   cannot carry a trailer, so it needs sequence-number or heartbeat gap
-   detection. This remains the largest open control gap, and `docs/CONTROLS.md`
-   lists it as such rather than faking a control total.
-7. **Backfill and reprocessing.** The DAG is keyed by business date but there is
-   no command to re-run a range of past dates, which is the first thing anyone
-   asks for after a logic fix. (SE-2 has replay; this does not.)
+5. **A persistent mart.** `t_load_mart` builds a DuckDB instance per run and does
+   not keep it, so the backfill cannot diff a date's new output against its old
+   one — it reports what it produced, not what it changed. That is a real
+   limitation of the backfill and it is stated here rather than papered over
+   with a dry-run column that always reads zero.
+6. **Backfill approval.** Nothing schedules the backfill and nothing approves it.
+   It will happily rewrite a signed-off period if you name one; restate versus
+   adjust-forward is a controllership decision, not a config flag.
+7. **Producer-side sequence emission.** The completeness control assumes the
+   producer emits sequence numbers and heartbeats. Here the generator does,
+   because it was written to. A real processor that emits neither cannot be made
+   complete-able by anything on the consumer side, and that negotiation is the
+   actual work.

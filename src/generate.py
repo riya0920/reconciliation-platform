@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import random
 from dataclasses import asdict, dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,14 +112,74 @@ def generate(n_days: int = 5, per_day: int = 900, seed: int = 11):
 
     DATA.mkdir(exist_ok=True)
     _write_bai2(core_rows, DATA / "core_batch.txt")
+
+    # ------------------------------------------------- stream completeness
+    # The processor feed now carries what an event stream needs in order to be
+    # checkable at all: a per-partition monotonic sequence number, and periodic
+    # heartbeats carrying the producer's high-water mark. Without the first, a
+    # dropped event is an absence nobody can see; without the second, a feed
+    # that stops looks exactly like a quiet market.
+    #
+    # Three faults are planted, and they are planted at the TRANSPORT layer --
+    # the events are correct, they simply do not all arrive:
+    #   dropped     events removed after numbering, so the sequence has a hole
+    #   reordered   events delivered late but within the reorder grace window
+    #   silent      one partition stops heartbeating before the window closes
+    partitions = ["p0", "p1", "p2", "p3"]
+    seq_by_part = {p: 0 for p in partitions}
+    stamped = []
+    for i, m in enumerate(proc_rows):
+        part = partitions[hash(m.ref) % len(partitions)]
+        seq_by_part[part] += 1
+        d = asdict(m)
+        d["partition"] = part
+        d["seq"] = seq_by_part[part]
+        stamped.append(d)
+
+    produced_high_water = dict(seq_by_part)
+
+    # Drop 12 consecutive events from p1 -- a real loss, far enough back that
+    # the grace window has closed on it by the end of the stream.
+    p1 = [i for i, d in enumerate(stamped) if d["partition"] == "p1"]
+    dropped = set(p1[len(p1) // 3: len(p1) // 3 + 12])
+
+    # Move 5 p2 events to the end of the file: out of order, nothing lost. The
+    # completeness control must NOT report these as missing.
+    p2 = [i for i, d in enumerate(stamped) if d["partition"] == "p2"]
+    delayed = set(p2[-25:-20])
+
+    delivered = [d for i, d in enumerate(stamped)
+                 if i not in dropped and i not in delayed]
+    delivered += [stamped[i] for i in sorted(delayed)]
+
     with (DATA / "processor_events.jsonl").open("w", encoding="utf-8") as fh:
-        for m in proc_rows:
-            fh.write(json.dumps(asdict(m)) + "\n")
+        for d in delivered:
+            fh.write(json.dumps(d) + "\n")
+
+    # Heartbeats. p3 goes silent 40 minutes before the close, which no sequence
+    # check can see because there is no later event to be out of sequence with.
+    beats = []
+    close = datetime(2026, 3, 7, 18, 0, 0, tzinfo=timezone.utc)
+    for part in partitions:
+        last = close if part != "p3" else close - timedelta(minutes=40)
+        beats.append({"partition": part, "at": last.isoformat(),
+                      "producer_high_water": produced_high_water[part]})
+    (DATA / "processor_heartbeats.json").write_text(
+        json.dumps(beats, indent=1), encoding="utf-8")
+
+    (DATA / "stream_truth.json").write_text(json.dumps({
+        "dropped_events": len(dropped),
+        "delayed_events": len(delayed),
+        "silent_partition": "p3",
+        "producer_high_water": produced_high_water,
+    }, indent=1), encoding="utf-8")
     (DATA / "ground_truth_breaks.json").write_text(
         json.dumps([asdict(b) for b in planted], indent=1), encoding="utf-8")
 
     return {"truth": len(truth), "core": len(core_rows),
-            "processor": len(proc_rows), "planted": len(planted)}
+            "processor": len(delivered), "planted": len(planted),
+            "dropped_in_transport": len(dropped),
+            "delayed_in_transport": len(delayed)}
 
 
 def _write_bai2(rows: list[Movement], path: Path) -> None:
