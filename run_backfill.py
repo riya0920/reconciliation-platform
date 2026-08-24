@@ -75,14 +75,7 @@ def _save_state(state: dict) -> None:
 
 
 def _rows_for(business_date: str) -> tuple[int, int]:
-    """How many source rows each side holds for this date.
-
-    Read from the FILES, not from the mart. `t_load_mart` builds a DuckDB
-    instance per run and does not persist it, so querying the mart between runs
-    returns zero for every date -- which reads as "nothing there yet" rather
-    than "nothing is stored", and is the sort of reassuring nonsense a dry run
-    exists to avoid printing.
-    """
+    """Source rows on each side for this date, from the FILES."""
     from src.ingest import parse_bai2, parse_events
 
     core = [r for r in parse_bai2(DATA / "core_batch.txt").records
@@ -90,6 +83,26 @@ def _rows_for(business_date: str) -> tuple[int, int]:
     proc = [r for r in parse_events(DATA / "processor_events.jsonl").records
             if r.business_date == business_date]
     return len(core), len(proc)
+
+
+def _mart_rows(business_date: str) -> int:
+    """What the mart currently holds for this date.
+
+    This used to be unanswerable: `t_load_mart` unlinked the whole database on
+    every run, so the mart was per-run and a backfill destroyed every date
+    except the one it was rebuilding. It now replaces ONE date and leaves the
+    rest, which is what lets a dry run say what it would OVERWRITE rather than
+    only what it would produce.
+    """
+    from src.mart import ReportingMart
+
+    db = DATA / "mart.duckdb"
+    if not db.exists():
+        return 0
+    try:
+        return ReportingMart(db).rows_for(business_date)
+    except Exception:                                        # noqa: BLE001
+        return 0
 
 
 def main() -> int:
@@ -129,12 +142,23 @@ def main() -> int:
     if args.dry_run:
         print("-" * 78)
         print("DRY RUN -- nothing was written. These dates WOULD be rewritten:")
-        print("   {:<14}{:>10}{:>12}".format("date", "core rows", "proc rows"))
+        if not todo:
+            print("   Nothing to do: every date in the range is already on")
+            print("   record as complete. Use --force to rebuild them anyway.")
+            print("=" * 78)
+            return 0
+        print("   {:<14}{:>10}{:>12}{:>16}".format(
+            "date", "core rows", "proc rows", "IN MART NOW"))
         for d in todo:
             core, proc = _rows_for(d.isoformat())
-            print("   {:<14}{:>10}{:>12}{}".format(
-                d.isoformat(), core, proc,
-                "   <- nothing for this date" if not core and not proc else ""))
+            held = _mart_rows(d.isoformat())
+            note = ""
+            if not core and not proc:
+                note = "   <- nothing for this date"
+            elif held:
+                note = "   <- WOULD OVERWRITE"
+            print("   {:<14}{:>10}{:>12}{:>16}{}".format(
+                d.isoformat(), core, proc, held, note))
         print()
         print("A backfill is a bulk overwrite of figures somebody may already")
         print("have reported. The moment to discover the range was wrong is")

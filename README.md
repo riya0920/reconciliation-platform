@@ -1,11 +1,11 @@
 # DATA-1 — Regulatory Reporting & Reconciliation Platform
 
-**Status: ~95%.** Reconciliation engine, control-total gate, break taxonomy,
+**Status: ~97%.** Reconciliation engine, control-total gate, break taxonomy,
 break workflow with an append-only audit trail, a DAG runner driving the **real
 pipeline**, a persistent break queue, a **DuckDB reporting mart with drill-down
 that ties**, **stream completeness for the processor feed** (sequence gaps +
 heartbeats, scored against planted transport faults), and a **resumable
-date-range backfill** -- **49 tests**. What is missing is a scheduler to invoke
+date-range backfill** -- **60 tests**. What is missing is a scheduler to invoke
 it.
 
 ```bash
@@ -15,7 +15,7 @@ python run_completeness.py                        # stream completeness, scored
 python run_backfill.py --from 2026-03-02 --to 2026-03-06 --dry-run
 python run_recon.py                               # reconciliation on its own
 python run_workflow.py                            # queue, escalation, audit
-python -m pytest tests -q                         # 49 tests
+python -m pytest tests -q                         # 60 tests
 ```
 
 See [docs/CONTROLS.md](docs/CONTROLS.md) for the controls narrative, written in
@@ -198,6 +198,56 @@ slice is internally consistent — and to require both. Collapsing them lets a
 correct file fail because one day was asked for, or, far worse, lets a truncated
 file pass because the day requested happened to survive the truncation.
 
+## A persistent mart, and the backfill that can finally see what it overwrites
+
+`t_load_mart` unlinked the whole DuckDB file on every run. The mart was
+therefore per-RUN rather than persistent, with two consequences that only show
+up once you have a backfill:
+
+- **A backfill destroyed every date except the one it was rebuilding.**
+- **"What did this run change?" was unanswerable**, because there was never a
+  previous version to compare against — so the dry run could only report what it
+  would *produce*.
+
+The load is now idempotent per date: `replace_business_date` deletes one day and
+leaves the rest. Four dates backfilled, four dates persisted:
+
+```
+   date           core rows   proc rows     IN MART NOW
+   2026-03-02           888         881            1769   <- WOULD OVERWRITE
+   2026-03-03           898         882            1780   <- WOULD OVERWRITE
+   2026-03-04           892         900            1792   <- WOULD OVERWRITE
+```
+
+That last column is the point. A backfill is a bulk overwrite of figures
+somebody may already have reported, and the dry run now says what it would
+destroy rather than only what it would create.
+
+## Four-eyes review
+
+`workflow.py` enforces segregation of duties by ROLE — an analyst cannot apply
+`counterparty_error`, only a controller may write off. That answers *"is this
+person allowed to?"* and leaves the other question open: **"did anyone else
+look?"** A controller acting alone on a $2m break is fully authorised and
+completely unreviewed.
+
+`src/four_eyes.py` refuses the two ways the control gets faked:
+
+- **Self-approval.** The maker approving under a second hat. The check compares
+  actor identity and refuses equality — necessary, and **not sufficient**: two
+  accounts belonging to one person pass it trivially. That is an identity
+  problem, and saying so is more honest than pretending a string comparison
+  solved it.
+- **Rubber-stamping.** Code cannot detect intent, but it can require a distinct
+  written justification and record elapsed time. `review_speed_report` surfaces
+  reviews that took four seconds, which is what lets somebody audit the
+  auditors.
+
+**The threshold is what preserves the control.** Requiring four eyes on every
+break makes it theatre — with hundreds of items a day the checker approves in
+bulk and the review means nothing. It is a parameter, because it belongs to
+policy.
+
 ## What is NOT built
 
 1. **A SCHEDULER.** `run_dag.py` runs the real pipeline through a DAG with
@@ -211,8 +261,10 @@ file pass because the day requested happened to survive the truncation.
    hand-rolled in `t_validate`. It does the same job and is not the named tool.
 3. **dbt.** The mart is DuckDB DDL in `src/mart.py`, not dbt models — so no
    lineage graph, no `dbt test`, no docs site. (DATA-2 is the dbt project.)
-4. **Review UI**, assignment, and four-eyes review on high-value resolutions.
-   The queue is a table and a console report.
+4. **A review UI and assignment.** Four-eyes approval is implemented and
+   tested; there is no interface for a checker to work a queue, and no
+   assignment -- so in practice the pending list is a table somebody has to be
+   told about.
 5. **A persistent mart.** `t_load_mart` builds a DuckDB instance per run and does
    not keep it, so the backfill cannot diff a date's new output against its old
    one — it reports what it produced, not what it changed. That is a real

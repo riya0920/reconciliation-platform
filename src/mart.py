@@ -94,6 +94,39 @@ class ReportingMart:
             "INSERT INTO fct_break VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
         return len(rows)
 
+    def replace_business_date(self, business_date: str) -> dict:
+        """Delete one day's rows so it can be reloaded. Idempotent per date.
+
+        `t_load_mart` used to unlink the whole database on every run, which made
+        the mart per-run rather than persistent -- so `run_backfill.py` could
+        report what it PRODUCED and never what it CHANGED, and a re-run of one
+        date silently destroyed every other date.
+
+        Deleting by date rather than truncating is what makes a backfill
+        re-runnable: the day being rebuilt goes, and the twenty-nine days around
+        it stay.
+        """
+        counts = {}
+        for table in ("fct_source_record", "fct_break", "agg_daily_settlement"):
+            before = self.con.execute(
+                "SELECT COUNT(*) FROM {} WHERE business_date = ?".format(table),
+                [business_date]).fetchone()[0]
+            self.con.execute(
+                "DELETE FROM {} WHERE business_date = ?".format(table),
+                [business_date])
+            counts[table] = int(before)
+        return counts
+
+    def rows_for(self, business_date: str) -> int:
+        return int(self.con.execute(
+            "SELECT COUNT(*) FROM fct_source_record WHERE business_date = ?",
+            [business_date]).fetchone()[0])
+
+    def dates(self) -> list[str]:
+        return [str(r[0]) for r in self.con.execute(
+            "SELECT DISTINCT business_date FROM fct_source_record"
+            " ORDER BY business_date").fetchall()]
+
     def build_aggregates(self) -> int:
         self.con.execute("DELETE FROM agg_daily_settlement")
         self.con.execute("""

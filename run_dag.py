@@ -150,14 +150,19 @@ def t_load_breaks(ctx):
 
 
 def t_load_mart(ctx):
-    if MART_DB.exists():
-        MART_DB.unlink()
+    # The mart PERSISTS across runs. This used to unlink the whole database
+    # every time, which made a backfill destroy every date except the one it was
+    # rebuilding -- and made "what did this run change?" unanswerable, because
+    # there was never a previous version to compare against.
     mart = ReportingMart(MART_DB)
+    bdate = ctx.get("business_date")
+    replaced = mart.replace_business_date(bdate) if bdate else {}
     n_core = mart.load_records(ctx["core"].records)
     n_proc = mart.load_records(ctx["proc"].records)
     n_breaks = mart.load_breaks(ctx["recon"].breaks, tier_for)
     ctx["mart"] = mart
-    return {"source_rows": n_core + n_proc, "breaks": n_breaks}
+    return {"source_rows": n_core + n_proc, "breaks": n_breaks,
+            "replaced_rows": sum(replaced.values()) if replaced else 0}
 
 
 def t_build_aggregates(ctx):
