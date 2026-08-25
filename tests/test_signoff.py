@@ -244,3 +244,69 @@ def test_authorise_raises_rather_than_returning_false(con):
     sign_off(con, DATES[0], "jo")
     with pytest.raises(BackfillNotAuthorised):
         authorise(con, DATES, ROWS)
+
+
+# ------------------------------------------- the timer, and what it must not do
+def test_the_reconciliation_timer_is_NOT_persistent():
+    """The opposite of ML-1's monitoring timer, and deliberately so.
+
+    Monitoring is not cumulative, so a missed run coalesces and Persistent=true
+    is right there. Settlement state IS cumulative: a later date computed
+    against an uncorrected predecessor finishes, reports success, and is wrong
+    in the way hardest to notice.
+
+    A timer that quietly back-filled would also bypass the sign-off control in
+    this module entirely -- so the flag is a control, not tidiness.
+    """
+    from pathlib import Path
+
+    unit = (Path(__file__).resolve().parents[1] / "ops"
+            / "install_timers.sh").read_text(encoding="utf-8")
+    assert "Persistent=false" in unit
+    assert "Persistent=true" not in unit
+    assert "run_backfill.py" in unit, (
+        "the unit must name what DOES catch up, or an operator will make the "
+        "timer do it")
+
+
+def test_the_tick_reconciles_yesterday_not_today():
+    """A reconciliation running at 19:30 reconciles the day that has FINISHED.
+    Against today it reconciles a partial day and reports breaks that are simply
+    the rest of the day not having happened -- the most convincing wrong answer
+    available, because it looks like real work."""
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import run_dag_tick
+
+    expected = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    assert run_dag_tick.business_date(["run_dag_tick.py"]) == expected
+    assert run_dag_tick.business_date(["x", "2026-03-02"]) == "2026-03-02"
+
+
+def test_an_sla_breach_is_not_reported_to_systemd_as_a_failure():
+    """The run produced correct output and took too long. A unit marked failed
+    for that trains an operator to ignore the colour."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import run_dag_tick
+
+    assert run_dag_tick.EXIT_SLA_BREACH == 20
+    assert run_dag_tick.EXIT_FAILED == 1
+    unit = (Path(__file__).resolve().parents[1] / "ops"
+            / "install_timers.sh").read_text(encoding="utf-8")
+    assert "SuccessExitStatus=0 20" in unit
+
+
+def test_the_timer_fires_after_the_cutoff_not_at_midnight():
+    """A reconciliation that runs before the file lands reconciles yesterday's
+    file against today's date and reports a clean break-free run."""
+    from pathlib import Path
+
+    unit = (Path(__file__).resolve().parents[1] / "ops"
+            / "install_timers.sh").read_text(encoding="utf-8")
+    assert "OnCalendar=*-*-* 19:30:00" in unit
