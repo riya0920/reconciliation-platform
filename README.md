@@ -265,11 +265,21 @@ policy.
    tested; there is no interface for a checker to work a queue, and no
    assignment -- so in practice the pending list is a table somebody has to be
    told about.
-5. **A persistent mart.** `t_load_mart` builds a DuckDB instance per run and does
-   not keep it, so the backfill cannot diff a date's new output against its old
-   one — it reports what it produced, not what it changed. That is a real
-   limitation of the backfill and it is stated here rather than papered over
-   with a dry-run column that always reads zero.
+5. ~~**A persistent mart.**~~ **DONE** — `t_load_mart` keeps the DuckDB
+   instance and replaces ONE date rather than unlinking the database, so the
+   twenty-nine days around a rebuilt one survive.
+
+   And the consequence the item was really about: `run_backfill.py` now reports
+   **what it CHANGED**, not only what it produced. It snapshots each date before
+   and after and prints the deltas — including the case that matters most, *"2
+   dates rebuilt with NO change"*. A backfill that changed nothing is a
+   different outcome from one that corrected a figure, and reporting them the
+   same way is how a re-run gets celebrated for doing nothing; if a fix was
+   expected and nothing moved, it did not land.
+
+   The diff covers amounts as well as counts, because a rebuild producing the
+   same NUMBER of rows with different values is exactly the correction a re-run
+   is usually for, and a count-only diff calls that no change.
 6. ~~**Backfill approval.**~~ **DONE** (approval; scheduling still open) —
    `src/signoff.py` requires an approved, second-person request before a
    backfill may rewrite a **signed-off** date. An open date still runs freely,

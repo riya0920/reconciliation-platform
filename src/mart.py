@@ -122,6 +122,50 @@ class ReportingMart:
             "SELECT COUNT(*) FROM fct_source_record WHERE business_date = ?",
             [business_date]).fetchone()[0])
 
+    def snapshot_for(self, business_date: str) -> dict:
+        """What the mart currently holds for this date, as comparable figures.
+
+        Taken BEFORE a rebuild and again after, so a backfill can report what it
+        CHANGED rather than only what it produced. Without this the operator
+        sees "846 matched, 103 breaks" and has no idea whether that is the same
+        as yesterday's answer or a correction -- which is the only question a
+        backfill is run to answer.
+
+        Amounts as well as counts, because a rebuild that produces the same
+        NUMBER of rows with different values is exactly the correction a
+        re-run is usually for, and a count-only diff reports it as no change.
+        """
+        row = self.con.execute(
+            "SELECT COUNT(*) AS rows, COALESCE(SUM(amount_minor), 0) AS amount"
+            "  FROM fct_source_record WHERE business_date = ?",
+            [business_date]).fetchone()
+        brk = self.con.execute(
+            "SELECT COUNT(*) AS breaks,"
+            "       COALESCE(SUM(COALESCE(variance_minor, 0)), 0) AS variance"
+            "  FROM fct_break WHERE business_date = ?",
+            [business_date]).fetchone()
+        return {"business_date": business_date,
+                "source_rows": int(row[0]), "source_amount_minor": int(row[1]),
+                "breaks": int(brk[0]), "variance_minor": int(brk[1])}
+
+    @staticmethod
+    def diff(before: dict, after: dict) -> dict:
+        """What a rebuild changed. Empty `changes` means it changed nothing.
+
+        A backfill that reports "complete" having changed nothing is a
+        DIFFERENT outcome from one that corrected a figure, and collapsing them
+        is how a re-run gets celebrated for doing nothing. Reported either way
+        rather than only when something moved.
+        """
+        fields = ("source_rows", "source_amount_minor", "breaks",
+                  "variance_minor")
+        changes = {f: {"before": before.get(f, 0), "after": after.get(f, 0),
+                       "delta": after.get(f, 0) - before.get(f, 0)}
+                   for f in fields if before.get(f, 0) != after.get(f, 0)}
+        return {"business_date": after.get("business_date"),
+                "changed": bool(changes), "changes": changes,
+                "was_new": before.get("source_rows", 0) == 0}
+
     def dates(self) -> list[str]:
         return [str(r[0]) for r in self.con.execute(
             "SELECT DISTINCT business_date FROM fct_source_record"

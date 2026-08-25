@@ -249,9 +249,31 @@ def main() -> int:
     print("{:<14}{:>8}{:>8}{:>10}{:>9}{:>10}{:>10}".format(
         "date", "tasks", "failed", "matched", "breaks", "seconds", "result"))
 
+    def _snapshot(iso: str) -> dict:
+        """The mart's figures for a date, taken before and after a rebuild.
+
+        This is what turns "what did this produce" into "what did this CHANGE",
+        which is the only question a backfill is run to answer. It became
+        possible when the mart stopped being rebuilt from scratch on every run:
+        before that there was never a previous version to compare against.
+        """
+        from src.mart import ReportingMart
+
+        db = DATA / "mart.duckdb"
+        empty = {"business_date": iso, "source_rows": 0,
+                 "source_amount_minor": 0, "breaks": 0, "variance_minor": 0}
+        if not db.exists():
+            return empty
+        try:
+            return ReportingMart(db).snapshot_for(iso)
+        except Exception:                                    # noqa: BLE001
+            return empty
+
     failures = 0
+    diffs = []
     for d in todo:
         iso = d.isoformat()
+        before = _snapshot(iso)
         try:
             from run_dag import TASKS
             dag = DagRun(TASKS, business_date=iso, sla_deadline_s=60.0)
@@ -266,6 +288,9 @@ def main() -> int:
                 out.get("matched", "-"), out.get("breaks", "-"),
                 report.get("duration_s", 0.0), "OK" if ok else "FAILED"))
             if ok:
+                from src.mart import ReportingMart
+
+                diffs.append(ReportingMart.diff(before, _snapshot(iso)))
                 if iso not in state["completed"]:
                     state["completed"].append(iso)
                 state["runs"].append({"date": iso, "result": "ok"})
@@ -298,6 +323,34 @@ def main() -> int:
     if args.request is not None and not failures:
         consume(con, args.request)
         con.commit()
+
+    # ---- what actually CHANGED -------------------------------------------
+    if diffs:
+        print("-" * 78)
+        print("WHAT CHANGED")
+        print("-" * 78)
+        moved = [d for d in diffs if d["changed"] and not d["was_new"]]
+        created = [d for d in diffs if d["was_new"]]
+        unchanged = [d for d in diffs if not d["changed"] and not d["was_new"]]
+
+        for d in moved:
+            print("   {}".format(d["business_date"]))
+            for field, c in sorted(d["changes"].items()):
+                print("      {:<22}{:>14,} -> {:>14,}  ({:+,})".format(
+                    field, c["before"], c["after"], c["delta"]))
+        for d in created:
+            print("   {}   NEW -- no previous version to compare".format(
+                d["business_date"]))
+        if unchanged:
+            print("   {} date(s) rebuilt with NO change: {}".format(
+                len(unchanged),
+                ", ".join(d["business_date"] for d in unchanged[:6])))
+            print()
+            print("   A backfill that changed nothing is a different outcome")
+            print("   from one that corrected a figure, and reporting them the")
+            print("   same way is how a re-run gets celebrated for doing")
+            print("   nothing. If a fix was expected here, it did not land.")
+        print()
 
     print("-" * 78)
     print("completed dates on record: {}".format(len(state["completed"])))

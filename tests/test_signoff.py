@@ -314,3 +314,67 @@ def test_the_timer_fires_after_the_cutoff_not_at_midnight():
     unit = (Path(__file__).resolve().parents[1] / "ops"
             / "install_timers.sh").read_text(encoding="utf-8")
     assert "OnCalendar=*-*-* 19:30:00" in unit
+
+
+# ------------------------------------ what a backfill CHANGED, not produced
+def test_the_mart_can_be_snapshotted_before_and_after(tmp_path):
+    """The thing a per-run mart made impossible: there was never a previous
+    version to compare against."""
+    from src.mart import ReportingMart
+
+    m = ReportingMart(tmp_path / "m.duckdb")
+    snap = m.snapshot_for("2026-03-02")
+    assert set(snap) == {"business_date", "source_rows", "source_amount_minor",
+                         "breaks", "variance_minor"}
+    assert snap["source_rows"] == 0
+
+
+def test_a_rebuild_that_changes_nothing_says_so():
+    """A backfill that changed nothing is a DIFFERENT outcome from one that
+    corrected a figure, and reporting them the same way is how a re-run gets
+    celebrated for doing nothing."""
+    from src.mart import ReportingMart
+
+    snap = {"business_date": "2026-03-02", "source_rows": 100,
+            "source_amount_minor": 5000, "breaks": 3, "variance_minor": 10}
+    d = ReportingMart.diff(snap, dict(snap))
+    assert d["changed"] is False and d["changes"] == {}
+    assert d["was_new"] is False
+
+
+def test_a_changed_figure_is_reported_with_its_delta():
+    from src.mart import ReportingMart
+
+    before = {"business_date": "2026-03-02", "source_rows": 100,
+              "source_amount_minor": 5000, "breaks": 10, "variance_minor": 10}
+    after = dict(before, breaks=4)
+    d = ReportingMart.diff(before, after)
+    assert d["changed"] is True
+    assert d["changes"]["breaks"] == {"before": 10, "after": 4, "delta": -6}
+
+
+def test_an_amount_change_at_a_constant_row_count_is_caught():
+    """A rebuild producing the same NUMBER of rows with different values is
+    exactly the correction a re-run is usually for, and a count-only diff
+    reports it as no change."""
+    from src.mart import ReportingMart
+
+    before = {"business_date": "2026-03-02", "source_rows": 100,
+              "source_amount_minor": 5000, "breaks": 3, "variance_minor": 10}
+    after = dict(before, source_amount_minor=5100)
+    d = ReportingMart.diff(before, after)
+    assert d["changed"] is True
+    assert "source_amount_minor" in d["changes"]
+    assert "source_rows" not in d["changes"]
+
+
+def test_a_first_build_is_marked_new_rather_than_changed():
+    """"NEW" and "changed" are different: there was nothing to compare, so
+    reporting a delta against zero would overstate what happened."""
+    from src.mart import ReportingMart
+
+    before = {"business_date": "2026-03-02", "source_rows": 0,
+              "source_amount_minor": 0, "breaks": 0, "variance_minor": 0}
+    after = {"business_date": "2026-03-02", "source_rows": 100,
+             "source_amount_minor": 5000, "breaks": 3, "variance_minor": 10}
+    assert ReportingMart.diff(before, after)["was_new"] is True
