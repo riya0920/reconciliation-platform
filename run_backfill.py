@@ -30,11 +30,29 @@ what each one prevents:
                           rewritten and stops, because the moment to discover
                           the range was wrong is before the write.
 
-WHAT THIS STILL IS NOT. Nothing schedules it and nothing approves it. A backfill
-that rewrites a signed-off period is a controllership decision -- DATA-2's README
-makes the same point about restate-versus-adjust-forward -- and this command will
-happily rewrite a closed month if you name one. The guard is a human, and saying
-so is more honest than a config flag that pretends otherwise.
+  APPROVED, WHEN IT MATTERS  a date nobody has signed off is rewritten freely.
+                          A date somebody HAS signed off needs an approved
+                          request from a second person, bound to this exact set
+                          of dates and row counts -- see `src/signoff.py`.
+
+                          This paragraph used to say the opposite: that nothing
+                          approves a backfill, that the command "will happily
+                          rewrite a closed month if you name one", and that the
+                          guard is a human. That was honest and it was not a
+                          control. What made it buildable was `src/four_eyes.py`
+                          arriving for break resolutions -- the same mechanism
+                          pointed at the operation that can rewrite a reported
+                          figure.
+
+                          Requiring approval for EVERY backfill was considered
+                          and rejected. An approval prompt on re-running
+                          yesterday trains people to approve without reading,
+                          and a control everyone clicks through protects
+                          nothing.
+
+WHAT THIS STILL IS NOT. Nothing schedules it. And the approval is only as good
+as the sign-off registry: a date nobody remembered to sign off is, as far as this
+is concerned, open.
 """
 from __future__ import annotations
 
@@ -48,9 +66,24 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from src.orchestrate import DagRun
+from src.signoff import (BackfillNotAuthorised, authorise, consume, install,
+                         plan_hash, signed_off_within)
 
 DATA = ROOT / "data"
 STATE = DATA / "backfill_state.json"
+CONTROL_DB = DATA / "control.sqlite"
+
+
+def _control():
+    """The sign-off and approval registry. Separate from the mart on purpose:
+    the thing that authorises a rewrite must not live in the store being
+    rewritten."""
+    import sqlite3
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(CONTROL_DB)
+    install(con)
+    return con
 
 
 def _dates(start: date, end: date) -> list[date]:
@@ -112,6 +145,9 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="re-run dates already marked complete")
+    ap.add_argument("--request", type=int, default=None,
+                    help="id of an APPROVED backfill request, required when the "
+                         "range touches a signed-off date")
     args = ap.parse_args()
 
     start = date.fromisoformat(args.start)
@@ -163,8 +199,51 @@ def main() -> int:
         print("A backfill is a bulk overwrite of figures somebody may already")
         print("have reported. The moment to discover the range was wrong is")
         print("before the write, not in the diff afterwards.")
+        print()
+        con = _control()
+        isos = [d.isoformat() for d in todo]
+        counts = {i: _mart_rows(i) for i in isos}
+        protected = signed_off_within(con, isos)
+        print("plan fingerprint    : {}".format(plan_hash(isos, counts)))
+        print("signed-off in range : {}".format(
+            ", ".join(protected) if protected else "none"))
+        if protected:
+            print()
+            print("Quote that fingerprint in the approval request. It binds the")
+            print("approval to THESE dates and THESE row counts -- an approval")
+            print("for three dates that executes over thirty has an approval on")
+            print("file and no approval in fact.")
         print("=" * 78)
         return 0
+
+    # ---- the control, before anything is written ------------------------
+    #
+    # `run_backfill.py` used to say in its own docstring that nothing approves a
+    # backfill and "the guard is a human". That was honest and it was not a
+    # control. An OPEN date still runs freely -- requiring an approval to re-run
+    # yesterday trains people to approve without reading -- but a date somebody
+    # has signed off needs a second pair of eyes bound to this exact plan.
+    con = _control()
+    isos = [d.isoformat() for d in todo]
+    counts = {i: _mart_rows(i) for i in isos}
+    try:
+        auth = authorise(con, isos, counts, request_id=args.request)
+    except BackfillNotAuthorised as exc:
+        print("-" * 78)
+        print("REFUSED: {}".format(exc))
+        print()
+        print("Nothing was written. Raise a request with the plan fingerprint")
+        print("{} and have someone else approve it.".format(
+            plan_hash(isos, counts)))
+        print("=" * 78)
+        return 2
+
+    if auth["protected_dates"]:
+        print("authorisation       : {} (covering {})".format(
+            auth["reason"], ", ".join(auth["protected_dates"])))
+    else:
+        print("authorisation       : not required -- {}".format(auth["reason"]))
+    print()
 
     print("-" * 78)
     print("{:<14}{:>8}{:>8}{:>10}{:>9}{:>10}{:>10}".format(
@@ -212,8 +291,22 @@ def main() -> int:
             break
 
     _save_state(state)
+
+    # Consume the approval AFTER the run, and only on success. Burning it up
+    # front would leave an operator needing a fresh approval to retry something
+    # that never happened.
+    if args.request is not None and not failures:
+        consume(con, args.request)
+        con.commit()
+
     print("-" * 78)
     print("completed dates on record: {}".format(len(state["completed"])))
+    if args.request is not None:
+        print("approval {}: {}".format(
+            args.request,
+            "consumed -- it authorises one run, not a standing permission"
+            if not failures else "NOT consumed, the run failed; retry is still "
+                                 "authorised"))
     print()
     print("The per-date matched/breaks columns are the evidence that this is a")
     print("backfill rather than the same run repeated. The DAG carried a")
