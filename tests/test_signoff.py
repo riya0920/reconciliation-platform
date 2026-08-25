@@ -262,8 +262,12 @@ def test_the_reconciliation_timer_is_NOT_persistent():
 
     unit = (Path(__file__).resolve().parents[1] / "ops"
             / "install_timers.sh").read_text(encoding="utf-8")
-    assert "Persistent=false" in unit
-    assert "Persistent=true" not in unit
+    # Check the DIRECTIVE, not any occurrence of the string -- the header
+    # comment names Persistent=true when explaining the contrast with ML-1's
+    # monitoring timer, and a substring test would fail on the explanation.
+    directives = [l.strip() for l in unit.splitlines()
+                  if l.strip().startswith("Persistent=")]
+    assert directives == ["Persistent=false"], directives
     assert "run_backfill.py" in unit, (
         "the unit must name what DOES catch up, or an operator will make the "
         "timer do it")
