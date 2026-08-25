@@ -270,7 +270,13 @@ policy.
    one — it reports what it produced, not what it changed. That is a real
    limitation of the backfill and it is stated here rather than papered over
    with a dry-run column that always reads zero.
-6. **Backfill approval.** Nothing schedules the backfill and nothing approves it.
+6. ~~**Backfill approval.**~~ **DONE** (approval; scheduling still open) —
+   `src/signoff.py` requires an approved, second-person request before a
+   backfill may rewrite a **signed-off** date. An open date still runs freely,
+   because an approval prompt on re-running yesterday trains people to approve
+   without reading. The approval is bound to a fingerprint of the dates AND the
+   affected row counts, is single-use and expires in 24h. Nothing still
+   schedules it.
    It will happily rewrite a signed-off period if you name one; restate versus
    adjust-forward is a controllership decision, not a config flag.
 7. **Producer-side sequence emission.** The completeness control assumes the
