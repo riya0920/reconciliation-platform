@@ -250,7 +250,12 @@ policy.
 
 ## What is NOT built
 
-1. **A SCHEDULER.** `run_dag.py` runs the real pipeline through a DAG with
+1. ~~**A SCHEDULER.**~~ **DONE** — `ops/install_timers.sh` installs
+   `run_dag_tick.py` as a real systemd timer firing at 19:30, verified under
+   systemd (`ExecMainStatus=0`, 846 matched, 103 breaks). `Persistent=false`,
+   because settlement state is cumulative and catching up is `run_backfill.py`'s
+   job — subject to the sign-off approval a timer would bypass. Superseded note:
+   `run_dag.py` runs the real pipeline through a DAG with
    dependency ordering, cycle detection at construction, transient-vs-permanent
    retry policy, fail-fast gates and per-task plus pipeline SLA enforcement. What
    it does not do is schedule itself: something must invoke it at 07:00, and that
