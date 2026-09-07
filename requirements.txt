@@ -1,1 +1,2 @@
 pytest>=8
+duckdb>=1.0  # src/mart.py snapshots the mart
