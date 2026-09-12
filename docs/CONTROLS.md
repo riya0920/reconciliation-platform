@@ -41,15 +41,17 @@ load. Running accuracy checks first produces a confident wrong answer.
 drops five detail records from a real generated file and asserts row-level
 parsing never notices while the trailer does.
 
-## C2 — Completeness on the event feed — **KNOWN GAP**
+## C2 — Completeness on the event feed — **IMPLEMENTED**
 
 An event stream cannot carry a trailer, so C1 has no counterpart on the
 processor side. The correct control is sequence-number continuity or heartbeat
-gap detection, and **neither is implemented.** `parse_events` says so in a
-docstring rather than presenting a fabricated control total.
+gap detection. This was previously an open gap; it is now implemented in
+`src/stream_completeness.py`, which checks sequence continuity (gap/duplicate
+detection with a reorder grace window) and heartbeat liveness, so a dropped or
+silently partitioned feed is caught rather than assumed complete.
 
-This is the largest open control gap in the platform and it is stated here
-rather than in a footnote.
+**Evidence:** `tests/test_stream_completeness.py` (16 tests) covers dropped,
+delayed, and silently-partitioned feeds against a producer ground truth.
 
 ## C3 — Reconciliation with documented tolerances
 
@@ -131,8 +133,12 @@ control behind it.
 
 | # | Gap | Severity |
 |---|---|---|
-| C2 | No completeness control on the processor event feed | **High** |
 | — | No timeliness SLA or miss alerting (no orchestrator) | Medium |
 | — | No segregation between the party generating data and the party reconciling it — the same repo does both | Medium (inherent to a portfolio project) |
-| — | Break queue is in-memory per run; no persistent store across runs | Medium |
-| — | No four-eyes review on resolutions above a threshold | Low |
+
+Three gaps listed in earlier versions of this document are now closed and are
+documented above rather than here: event-feed completeness (C2,
+`src/stream_completeness.py`), a persistent break queue across runs
+(`src/workflow.py`, SQLite-backed with `first_seen` preserved on recurrence),
+and four-eyes review on high-value resolutions (`src/four_eyes.py`). Each has
+its own test file.
